@@ -291,6 +291,26 @@ class BlockPool:
         block_hashes = resolve_block_hashes(request, self.hash_block_size, block_size)
 
         new_block_hashes = block_hashes[num_cached_blocks:]
+        num_available_hashes = len(new_block_hashes)
+
+        def is_uncacheable(rel_idx: int) -> bool:
+            """Whether the block at this relative index is excluded from the cache.
+
+            Both loops below must agree on this, or `extra_keys_list` desyncs
+            from `new_hashes` when KV cache events are enabled.
+
+            Two reasons a block is excluded, and they are meant to coincide:
+            it is turn-local filler beyond `--filler-depth-tokens`, or its hash
+            was never computed because the hasher is capped at that same depth
+            (`get_request_block_hasher(max_hash_depth_tokens=...)`). The index
+            bound is kept as a separate check so that any drift between the two
+            thresholds degrades into "not cached" rather than an IndexError in
+            the scheduler.
+            """
+            if rel_idx >= num_available_hashes:
+                return True
+            return self._is_filler_depth((num_cached_blocks + rel_idx + 1) * block_size)
+
         new_hashes: list[ExternalBlockHash] | None = (
             [] if self.enable_kv_cache_events else None
         )
@@ -305,7 +325,7 @@ class BlockPool:
             # inserting them into the hash map only costs scheduler CPU. Skipping
             # leaves them unhashed, which also makes `free_blocks` prepend them
             # to the head of the free list so they are reclaimed first.
-            if self._is_filler_depth(num_hash_tokens):
+            if is_uncacheable(i):
                 if self.policy_stats is not None:
                     self.policy_stats.hash_inserts_skipped += 1
                 continue
@@ -357,7 +377,7 @@ class BlockPool:
                     continue
                 # Must mirror the skip in the loop above, otherwise
                 # `extra_keys_list` desyncs from `new_hashes`.
-                if self._is_filler_depth((i + 1) * block_size):
+                if is_uncacheable(i - num_cached_blocks):
                     continue
                 block_start = i * block_size
                 block_end = block_start + block_size

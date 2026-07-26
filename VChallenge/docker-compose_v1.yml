@@ -126,11 +126,26 @@ services:
       #   TTFT p50 < 50ms and TTFT p95, and every request here is a 4000-token
       #   prefill producing only 200 tokens — so this pushes the wrong way.
       #   A/B it alone before believing otherwise.
+
+      # ================================================================
+      # ABLATION H — free CPU, pending one unknown
+      # ================================================================
       #
-      # --stream-interval=N  (N > 1)
-      #   Looks like a CPU win (66,000 SSE chunks per run), but the first chunk
-      #   would then carry N tokens and be emitted later — directly inflating
-      #   measured TTFT. Keep the default of 1.
+      # --stream-interval=4
+      #   Cuts SSE chunks per run from ~66,000 to ~16,500 (each chunk costs a
+      #   detokenize + JSON serialize + socket write in the frontend process,
+      #   which competes with engine-core for the 3 cores).
+      #
+      #   It does NOT delay TTFT: output_processor.py:296 always emits the first
+      #   token regardless of the interval (`self.sent_tokens_offset == 0`).
+      #   Only tokens 2..200 get batched.
+      #
+      #   Held back from the default for two reasons:
+      #     1. Unknown whether the grader measures inter-chunk or inter-token
+      #        latency. If inter-chunk, lumpy delivery may score worse.
+      #     2. replay_trace.py must count tokens, not SSE chunks, or reported
+      #        TPOT is ~4x wrong. (Fixed — it now reads usage.completion_tokens.)
+      # - --stream-interval=4
 
     ports:
       - "8000:8000"

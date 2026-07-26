@@ -97,7 +97,10 @@ class TurnResult:
     ttft_ms: float | None = None
     tpot_ms: float | None = None
     total_ms: float | None = None
+    # True token count, from the server's usage block. Distinct from
+    # `stream_chunks`, which differs whenever --stream-interval > 1.
     output_tokens: int = 0
+    stream_chunks: int = 0
     error: str | None = None
 
 
@@ -164,11 +167,16 @@ async def run_turn(
         "stream": True,
         # Pin the output length exactly, as the workload spec requires.
         "ignore_eos": True,
-        "stream_options": {"include_usage": False},
+        # Ask for the usage block so TPOT is computed from real token counts.
+        # Counting SSE chunks instead would undercount by the stream interval:
+        # at --stream-interval=4 each chunk carries ~4 tokens, and TPOT would
+        # silently become chunks-per-second, flattering the config under test.
+        "stream_options": {"include_usage": True},
     }
     start = time.perf_counter()
     first_token_at: float | None = None
-    n_tokens = 0
+    n_chunks = 0
+    reported_tokens: int | None = None
     try:
         async with session.post(
             f"{args.base_url}/v1/completions",
@@ -194,12 +202,17 @@ async def run_turn(
                     chunk = json.loads(data)
                 except json.JSONDecodeError:
                     continue
+                # The usage block arrives on a trailing chunk whose `choices` is
+                # empty, so it must be read before the `choices` guard below.
+                usage = chunk.get("usage")
+                if usage and usage.get("completion_tokens") is not None:
+                    reported_tokens = int(usage["completion_tokens"])
                 choices = chunk.get("choices") or []
                 if not choices or not choices[0].get("text"):
                     continue
                 if first_token_at is None:
                     first_token_at = time.perf_counter()
-                n_tokens += 1
+                n_chunks += 1
     except Exception as exc:  # noqa: BLE001 - report, never abort the run
         return TurnResult(
             spec.conv_id,
@@ -220,7 +233,10 @@ async def run_turn(
         )
     ttft_ms = (first_token_at - start) * 1000
     decode_ms = (end - first_token_at) * 1000
-    tpot_ms = decode_ms / max(1, n_tokens - 1) if n_tokens > 1 else None
+    # Prefer the server-reported token count; fall back to chunk count only when
+    # usage is unavailable (in which case TPOT is only valid at interval 1).
+    output_tokens = reported_tokens if reported_tokens is not None else n_chunks
+    tpot_ms = decode_ms / max(1, output_tokens - 1) if output_tokens > 1 else None
     return TurnResult(
         spec.conv_id,
         spec.turn_idx,
@@ -229,7 +245,8 @@ async def run_turn(
         ttft_ms=ttft_ms,
         tpot_ms=tpot_ms,
         total_ms=(end - start) * 1000,
-        output_tokens=n_tokens,
+        output_tokens=output_tokens,
+        stream_chunks=n_chunks,
     )
 
 
@@ -318,6 +335,11 @@ class Report:
             "",
             f"  output tokens (mean) : "
             f"{statistics.fmean([r.output_tokens for r in ok]) if ok else 0:.1f}",
+            # Divergence between these two is the stream interval in effect.
+            # TPOT is computed from tokens, so it stays comparable across
+            # --stream-interval settings.
+            f"  SSE chunks    (mean) : "
+            f"{statistics.fmean([r.stream_chunks for r in ok]) if ok else 0:.1f}",
         ]
         if failed:
             lines.append("")

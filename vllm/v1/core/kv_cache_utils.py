@@ -775,6 +775,7 @@ def resolve_kv_cache_block_sizes(
 def get_request_block_hasher(
     hash_block_size: int,
     caching_hash_fn: Callable[[Any], bytes],
+    max_hash_depth_tokens: int | None = None,
 ) -> Callable[[Request], list[BlockHash]]:
     """
     Returns a function which computes the list of un-computed block hashes
@@ -784,11 +785,36 @@ def get_request_block_hasher(
     full prefix, so each hash uniquely fingerprints the prefix ending at its
     boundary. Coarser group block sizes and partial-cache boundaries reuse
     these hashes directly (see ``BlockHashListWithBlockSize``).
+
+    Args:
+        max_hash_depth_tokens: Stop hashing once the prefix reaches this depth in
+            tokens. ``None`` (the default) disables the cap and preserves stock
+            behavior exactly.
+
+            This exists because ``--enable-skip-filler-hashing`` already refuses
+            to insert blocks deeper than this into the prefix-cache hash map, so
+            computing their hashes is pure waste — at ``--block-size=32`` a
+            4000-token prompt produces 125 hashes of which only the first ~62 can
+            ever be used.
+
+            Consumers tolerate the shorter list: ``BlockPool.cache_full_blocks``
+            skips exactly the blocks whose depth exceeds the same threshold (and
+            bounds by list length regardless), and ``find_longest_cache_hit``
+            terminates naturally at the end of the list, which is the desired
+            behavior — a prefix hit cannot extend past uncached blocks anyway.
+
+            Must stay ``None`` whenever a KV connector is active: P/D and
+            offloading consume the full block-hash list.
     """
 
     def request_block_hasher(request: Request) -> list[BlockHash]:
         start_token_idx = len(request.block_hashes) * hash_block_size
         num_tokens = request.num_tokens
+
+        if max_hash_depth_tokens is not None and start_token_idx >= max_hash_depth_tokens:
+            # Everything that could ever be cached is already hashed. This makes
+            # every later append O(1) instead of hashing to the end of the prompt.
+            return []
 
         if start_token_idx + hash_block_size > num_tokens:
             # Early stop when there no new full blocks created.
@@ -826,6 +852,15 @@ def get_request_block_hasher(
             new_block_hashes.append(block_hash)
             start_token_idx += hash_block_size
             prev_block_hash_value = block_hash
+
+            if (
+                max_hash_depth_tokens is not None
+                and start_token_idx >= max_hash_depth_tokens
+            ):
+                # Cap reached. Note the check is after the append, so the list
+                # always covers at least `max_hash_depth_tokens` — never fewer
+                # hashes than a consumer bounded by that same depth requires.
+                break
 
         return new_block_hashes
 

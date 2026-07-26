@@ -149,6 +149,42 @@ is coarser cache granularity: a 1000-token prefix covers 15.6 blocks instead of
 Verify your attention backend accepts 64 before relying on it. Treat as an A/B,
 not a default — which is why `docker-compose_v1.yml` ships 32 with 64 documented.
 
+**T1.4 — `--stream-interval=4`. Free CPU, no TTFT cost.**
+
+330 graded requests × 200 tokens ≈ **66,000 SSE chunks**, each costing a
+detokenize step, a JSON serialization and a socket write in the frontend process.
+At interval 4 that drops to ~16,500.
+
+The obvious objection — "won't the first chunk carry 4 tokens and arrive later,
+inflating TTFT?" — does not apply. `vllm/v1/engine/output_processor.py:287-300`
+special-cases it:
+
+```python
+if self.stream_interval > 1:
+    # Send output request only when
+    # 1. It has finished, or
+    # 2. It is the first token, or
+    # 3. It has reached the stream interval number of tokens
+    if not (finished
+            or self.sent_tokens_offset == 0          # <-- first token, always sent
+            or self.detokenizer.num_output_tokens() - self.sent_tokens_offset
+               >= self.stream_interval):
+        return None
+```
+
+The first token is emitted immediately at any interval. TTFT is untouched; only
+tokens 2..200 are batched. On 3 cores the frontend competes with the engine-core
+process for CPU, so cutting frontend work frees scheduling headroom — which is
+where TTFT p95 is lost.
+
+Two caveats keep this an ablation rather than a default:
+
+* It is unknown whether the official grader measures inter-*chunk* or
+  inter-*token* latency. If inter-chunk, lumpy 4-token delivery could score worse
+  even though total CPU dropped.
+* `replay_trace.py` must count tokens rather than SSE chunks before this is
+  measured, or reported TPOT is ~4× wrong. Fixed as part of this change set.
+
 ### Tier 2 — right-size the KV cache
 
 **T2.1 — stop allocating KV cache you cannot use.**
@@ -201,17 +237,15 @@ where every request is a 4000-token prefill producing only 200 tokens.
 `docker-compose_v1.yml` therefore leaves it **off**, with the A/B documented. Do
 not stack it with other changes; measure it alone.
 
-**4.2 — `--stream-interval > 1` will make your measured TTFT worse.**
-
-It looks like an obvious CPU win: 200 output tokens × 330 requests = 66,000 SSE
-chunks, and raising the interval to 4 cuts that fourfold. But the first chunk
-would then contain 4 tokens instead of 1, so it is emitted **later** — and TTFT
-is measured at the first token. You would trade your headline metric for
-back-end CPU. Keep it at 1.
-
-**4.3 — Do not stack ablations.** With Poisson arrivals over 303 s on 3 cores,
+**4.2 — Do not stack ablations.** With Poisson arrivals over 303 s on 3 cores,
 run-to-run variance will likely exceed the effect size of any single change. One
 variable at a time, ≥3 runs each.
+
+> **Correction.** An earlier revision of this document listed
+> `--stream-interval > 1` here as a trap, on the claim that it would delay the
+> first token and inflate TTFT. **That was wrong.** vLLM already emits the first
+> token immediately regardless of the interval — see T1.4 in §3, where this now
+> appears as a recommendation rather than a warning.
 
 ---
 
@@ -246,6 +280,7 @@ and scheduler tuning.
 | E | D + `--block-size=64` | T1.3 |
 | F | D + `--prefix-cache-policy=slru` | T3.1 (only if gate passed) |
 | G | D + `--always-prioritize-decode` | §4.1 — expect regression |
+| H | D + `--stream-interval=4` | T1.4 — requires the token-counting harness fix |
 
 **Step 3 — replay.**
 
@@ -285,7 +320,7 @@ Shipped alongside this file. Its choices, and why:
 | `--prefix-cache-policy` | `lru` | Gated on §2; SLRU is built but changes nothing at zero evictions |
 | `--slru-protected-tokens` | `1000` | Pre-set so flipping to `slru` is a one-word edit |
 | `--always-prioritize-decode` | **off** | §4.1 — trades away the metric being scored |
-| `--stream-interval` | default (1) | §4.2 |
+| `--stream-interval` | default (1), with `4` as ablation H | T1.4 — free CPU, but grader chunk-vs-token semantics unknown |
 | `--block-size` | `32` | 64 is a documented A/B, not a default |
 | `--gpu-memory-utilization` | `0.95` | Unchanged pending the §2 reading |
 | `VLLM_PREFIX_CACHE_STATS` | off | Zero hot-path cost for the submission; a commented measurement block flips it on |

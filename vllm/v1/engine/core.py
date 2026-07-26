@@ -51,6 +51,7 @@ from vllm.v1.core.kv_cache_utils import (
     init_none_hash,
     resolve_kv_cache_block_sizes,
 )
+from vllm.v1.core.prefix_cache_policy import PrefixCachePolicyConfig
 from vllm.v1.core.sched.interface import PauseState, SchedulerInterface
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.core.single_type_kv_cache_manager import register_all_kvcache_specs
@@ -214,8 +215,20 @@ class EngineCore:
             )
             init_none_hash(caching_hash_fn)
 
+            # Stop hashing past the depth beyond which blocks are never inserted
+            # into the prefix cache anyway (see --enable-skip-filler-hashing).
+            # Only safe without a KV connector: P/D and offloading consume the
+            # full block-hash list.
+            max_hash_depth_tokens: int | None = None
+            if kv_connector is None:
+                prefix_cache_policy = PrefixCachePolicyConfig.from_config(
+                    vllm_config.cache_config
+                )
+                if prefix_cache_policy.enable_skip_filler_hashing:
+                    max_hash_depth_tokens = prefix_cache_policy.filler_depth_tokens
+
             self.request_block_hasher = get_request_block_hasher(
-                hash_block_size, caching_hash_fn
+                hash_block_size, caching_hash_fn, max_hash_depth_tokens
             )
 
         self.step_fn = (

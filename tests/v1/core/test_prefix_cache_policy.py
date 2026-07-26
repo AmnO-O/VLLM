@@ -8,19 +8,30 @@ Covers the segmented free list (SLRU), the depth-based classification in
 
 import pytest
 
+from vllm.sampling_params import SamplingParams
 from vllm.v1.core.block_pool import BlockPool
 from vllm.v1.core.kv_cache_utils import (
     BlockHash,
     FreeKVCacheBlockQueue,
     KVCacheBlock,
+    get_request_block_hasher,
+    init_none_hash,
     make_block_hash_with_group_id,
 )
 from vllm.v1.core.prefix_cache_policy import (
     PrefixCacheEvictionStats,
     PrefixCachePolicyConfig,
 )
+from vllm.v1.request import Request
 
 BLOCK_SIZE = 16
+
+
+@pytest.fixture(autouse=True)
+def _auto_init_hash_fn():
+    """`hash_block_tokens` reads the module-level NONE_HASH, which is only set
+    by `init_none_hash`. Mirrors the fixture in test_kv_cache_utils.py."""
+    init_none_hash(hash)
 
 
 def make_blocks(n: int) -> list[KVCacheBlock]:
@@ -368,3 +379,123 @@ def test_stats_record_evictions_when_enabled():
     # Drain the pool so the freed, still-cached blocks get reallocated.
     pool.get_new_blocks(pool.get_num_free_blocks())
     assert pool.policy_stats.evictions >= 2
+
+
+# --------------------------------------------------------------- hash cap
+#
+# The cap stops computing block hashes past --filler-depth-tokens, since those
+# blocks are never inserted into the prefix cache anyway. The risk it introduces
+# is an IndexError in cache_full_blocks when the hash list is shorter than the
+# block list, which would fail requests — so that path is tested explicitly.
+
+
+def make_capped_request(
+    num_tokens: int,
+    hash_block_size: int = 16,
+    max_hash_depth_tokens: int | None = None,
+) -> Request:
+    sampling_params = SamplingParams(max_tokens=17)
+    sampling_params.update_from_generation_config({}, eos_token_id=100)
+    return Request(
+        request_id="cap-test",
+        prompt_token_ids=list(range(num_tokens)),
+        mm_features=None,
+        sampling_params=sampling_params,
+        pooling_params=None,
+        lora_request=None,
+        cache_salt=None,
+        block_hasher=get_request_block_hasher(
+            hash_block_size, hash, max_hash_depth_tokens
+        ),
+        prompt_embeds=None,
+    )
+
+
+def test_hash_cap_limits_the_hash_list():
+    uncapped = make_capped_request(4000, 16, None)
+    capped = make_capped_request(4000, 16, 2000)
+    assert len(uncapped.block_hashes) == 250  # 4000 / 16
+    assert len(capped.block_hashes) == 125  # 2000 / 16
+    # The cap must only truncate, never alter, the chain.
+    assert capped.block_hashes == uncapped.block_hashes[:125]
+
+
+def test_hash_cap_disabled_matches_stock_behavior():
+    """`None` is the documented off switch and must be exactly uncapped."""
+    req = make_capped_request(4000, 16, None)
+    assert len(req.block_hashes) == 4000 // 16
+
+
+def test_hash_cap_covers_at_least_the_requested_depth():
+    """Never fewer hashes than a consumer bounded by the same depth needs."""
+    for hash_block_size in (16, 32):
+        for cap in (999, 1000, 2000, 3000):
+            req = make_capped_request(8000, hash_block_size, cap)
+            assert len(req.block_hashes) * hash_block_size >= cap
+
+
+def test_hash_cap_repeated_updates_are_noops():
+    req = make_capped_request(4000, 16, 2000)
+    before = len(req.block_hashes)
+    for _ in range(5):
+        req.update_block_hashes()
+    assert len(req.block_hashes) == before
+
+
+def test_cache_full_blocks_tolerates_a_short_hash_list():
+    """The IndexError scenario: more full blocks than computed hashes.
+
+    Without the length bound in `cache_full_blocks`, indexing `new_block_hashes`
+    past the cap raises inside the scheduler and fails the request.
+    """
+    hash_block_size = 16
+    pool = BlockPool(
+        num_gpu_blocks=512,
+        enable_caching=True,
+        hash_block_size=hash_block_size,
+        policy_config=PrefixCachePolicyConfig(
+            enable_skip_filler_hashing=True, filler_depth_tokens=2000
+        ),
+    )
+    req = make_capped_request(4000, hash_block_size, 2000)
+    assert len(req.block_hashes) == 125
+
+    num_full_blocks = 250  # twice the number of available hashes
+    blocks = pool.get_new_blocks(num_full_blocks)
+    pool.cache_full_blocks(
+        request=req,
+        blocks=blocks,
+        num_cached_blocks=0,
+        num_full_blocks=num_full_blocks,
+        block_size=hash_block_size,
+        kv_cache_group_id=0,
+    )
+
+    # Blocks within the cap are cached; everything past it is left unhashed.
+    assert all(b.block_hash is not None for b in blocks[:125])
+    assert all(b.block_hash is None for b in blocks[125:])
+
+
+def test_cache_full_blocks_short_hash_list_with_offset():
+    """Same, but starting partway in, so rel/absolute indices differ."""
+    hash_block_size = 16
+    pool = BlockPool(
+        num_gpu_blocks=512,
+        enable_caching=True,
+        hash_block_size=hash_block_size,
+        policy_config=PrefixCachePolicyConfig(
+            enable_skip_filler_hashing=True, filler_depth_tokens=2000
+        ),
+    )
+    req = make_capped_request(4000, hash_block_size, 2000)
+    blocks = pool.get_new_blocks(250)
+    pool.cache_full_blocks(
+        request=req,
+        blocks=blocks,
+        num_cached_blocks=100,
+        num_full_blocks=250,
+        block_size=hash_block_size,
+        kv_cache_group_id=0,
+    )
+    assert all(b.block_hash is not None for b in blocks[100:125])
+    assert all(b.block_hash is None for b in blocks[125:])

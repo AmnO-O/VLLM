@@ -25,6 +25,10 @@ from vllm.v1.core.kv_cache_utils import (
     maybe_convert_block_hash,
     resolve_block_hashes,
 )
+from vllm.v1.core.prefix_cache_policy import (
+    PrefixCacheEvictionStats,
+    PrefixCachePolicyConfig,
+)
 from vllm.v1.request import Request
 
 logger = init_logger(__name__)
@@ -157,6 +161,9 @@ class BlockPool:
             actual block size can be a multiple of hash_block_size.
         enable_kv_cache_events: Whether to enable kv cache events.
         metrics_collector: Optional metrics collector for tracking block residency.
+        policy_config: Resolved prefix-cache eviction policy knobs. Defaults to
+            the CLI/env-resolved configuration, which in turn defaults to plain
+            LRU with filler-hash skipping.
     """
 
     def __init__(
@@ -166,11 +173,32 @@ class BlockPool:
         hash_block_size: int,
         enable_kv_cache_events: bool = False,
         metrics_collector: KVCacheMetricsCollector | None = None,
+        policy_config: PrefixCachePolicyConfig | None = None,
     ):
         assert isinstance(num_gpu_blocks, int) and num_gpu_blocks > 0
         self.num_gpu_blocks = num_gpu_blocks
         self.enable_caching = enable_caching
         self.hash_block_size = hash_block_size
+
+        # Prefix-cache eviction policy. Resolve from env when not supplied so
+        # that direct BlockPool construction (tests, offline tools) still honors
+        # the environment knobs.
+        self.policy_config = policy_config or PrefixCachePolicyConfig.from_config()
+        self.policy_config.log_once()
+        self.use_slru = self.policy_config.use_slru
+        self.slru_protected_tokens = self.policy_config.slru_protected_tokens
+        self.skip_filler_hashing = (
+            self.policy_config.enable_skip_filler_hashing and enable_caching
+        )
+        self.filler_depth_tokens = self.policy_config.filler_depth_tokens
+        self.policy_stats: PrefixCacheEvictionStats | None = (
+            PrefixCacheEvictionStats() if self.policy_config.collect_stats else None
+        )
+        # Log a stats summary every this many allocated blocks, and immediately
+        # on the first eviction (the Phase-0 gate answer).
+        self._stats_log_interval = 20000
+        self._next_stats_log = self._stats_log_interval
+        self._logged_first_eviction = False
         # All kv-cache blocks.
         self.blocks: list[KVCacheBlock] = [
             KVCacheBlock(idx) for idx in range(num_gpu_blocks)
@@ -272,8 +300,16 @@ class BlockPool:
             # in align mode. We skip null blocks here.
             if blk.is_null or (block_mask is not None and not block_mask[i]):
                 continue
-            block_hash = new_block_hashes[i]
             num_hash_tokens = (num_cached_blocks + i + 1) * block_size
+            # Turn-local filler blocks are written once and never hit again, so
+            # inserting them into the hash map only costs scheduler CPU. Skipping
+            # leaves them unhashed, which also makes `free_blocks` prepend them
+            # to the head of the free list so they are reclaimed first.
+            if self._is_filler_depth(num_hash_tokens):
+                if self.policy_stats is not None:
+                    self.policy_stats.hash_inserts_skipped += 1
+                continue
+            block_hash = new_block_hashes[i]
 
             # Update and added the full block to the cache.
             block_hash_with_group_id = make_block_hash_with_group_id(
@@ -318,6 +354,10 @@ class BlockPool:
                 if blocks[i].is_null:
                     continue
                 if block_mask is not None and not block_mask[i - num_cached_blocks]:
+                    continue
+                # Must mirror the skip in the loop above, otherwise
+                # `extra_keys_list` desyncs from `new_hashes`.
+                if self._is_filler_depth((i + 1) * block_size):
                     continue
                 block_start = i * block_size
                 block_end = block_start + block_size
@@ -600,6 +640,39 @@ class BlockPool:
                 )
             )
 
+    def _is_filler_depth(self, num_hash_tokens: int) -> bool:
+        """Whether a block at this prefix depth is treated as write-once filler.
+
+        Filler blocks are excluded from the prefix-cache hash map when
+        `--enable-skip-filler-hashing` is on. Depth is measured in tokens from
+        the start of the prompt, so only content *beyond* the shared and
+        per-conversation prefixes is affected.
+        """
+        return self.skip_filler_hashing and num_hash_tokens > self.filler_depth_tokens
+
+    def _maybe_log_stats(self) -> None:
+        stats = self.policy_stats
+        if stats is None:
+            return
+        if not self._logged_first_eviction and stats.evictions > 0:
+            # The Phase-0 gate answer: the cache came under real pressure.
+            self._logged_first_eviction = True
+            logger.info(
+                "First prefix-cache eviction observed (free blocks bottomed out "
+                "at %s of %d). %s",
+                stats.min_free_blocks,
+                self.num_gpu_blocks,
+                stats.summary(),
+            )
+        if stats.allocations >= self._next_stats_log:
+            self._next_stats_log = stats.allocations + self._stats_log_interval
+            logger.info("%s", stats.summary())
+
+    def log_policy_stats(self) -> None:
+        """Log a prefix-cache policy stats summary, if collection is enabled."""
+        if self.policy_stats is not None:
+            logger.info("%s", self.policy_stats.summary())
+
     def _insert_block_hash(
         self,
         block_hash_with_group_id: BlockHashWithGroupId,
@@ -621,6 +694,8 @@ class BlockPool:
                 block_hash_with_group_id
             )
         self.cached_block_hash_to_block.insert(block_hash_with_group_id, block)
+        if self.policy_stats is not None:
+            self.policy_stats.hash_inserts += 1
 
     def get_new_blocks(self, num_blocks: int) -> list[KVCacheBlock]:
         """Get new blocks from the free block pool.
@@ -635,6 +710,11 @@ class BlockPool:
         """
         if num_blocks > self.get_num_free_blocks():
             raise ValueError(f"Cannot get {num_blocks} free blocks from the pool")
+
+        if self.policy_stats is not None:
+            self.policy_stats.record_allocation(
+                num_blocks, self.free_block_queue.num_free_blocks - num_blocks
+            )
 
         ret: list[KVCacheBlock] = self.free_block_queue.popleft_n(num_blocks)
 
@@ -669,10 +749,17 @@ class BlockPool:
         if self.metrics_collector:
             self.metrics_collector.on_block_evicted(block)
 
+        # Capture the depth before the hash metadata is reset below.
+        depth_tokens = block.block_hash_num_tokens
+
         evicted_hashes = self._remove_cached_block_hashes(block)
         if not evicted_hashes:
             # The block doesn't have hash, eviction is not needed
             return False
+
+        if self.policy_stats is not None:
+            self.policy_stats.record_eviction(depth_tokens)
+            self._maybe_log_stats()
 
         self._emit_block_removed_events(evicted_hashes)
         return True
@@ -685,9 +772,14 @@ class BlockPool:
         Args:
             blocks: A list of blocks to touch.
         """
+        if self.policy_stats is not None:
+            self.policy_stats.record_touch(len(blocks))
+
         for block in blocks:
             # ref_cnt=0 means this block is in the free list (i.e. eviction
-            # candidate), so remove it.
+            # candidate), so remove it. `remove` is segment-agnostic: it unlinks
+            # via the block's own neighbours, so it works for both the
+            # probationary and the protected SLRU segment.
             if block.ref_cnt == 0 and not block.is_null:
                 self.free_block_queue.remove(block)
             block.ref_cnt += 1
@@ -698,6 +790,17 @@ class BlockPool:
         """Free a list of blocks. The blocks should be ordered by their
         eviction priority, where the first block will be evicted first.
 
+        Under the default `lru` policy, hashed blocks are appended to the tail of
+        the single free list and unhashed blocks are prepended to its head, so
+        blocks that can never produce a cache hit are always reclaimed first.
+
+        Under `slru`, hashed blocks are additionally split by prefix depth:
+        shallow blocks (depth <= `slru_protected_tokens`, i.e. the shared system
+        prefix and the per-conversation prefix) go to the protected segment,
+        which is only drained once the probationary segment is empty. This
+        shields prefixes that have a scheduled future reuse from being evicted by
+        deeper, single-use content during the gap between conversation turns.
+
         Args:
             ordered_blocks: A list of blocks to free ordered by their eviction
                 priority.
@@ -705,17 +808,29 @@ class BlockPool:
         # Identify blocks with hash (LRU cache) and without it (will never match in APC)
         blocks_with_hash = []
         blocks_without_hash = []
+        protected_blocks = []
+        use_slru = self.use_slru
+        protected_tokens = self.slru_protected_tokens
         for block in ordered_blocks:
             block.ref_cnt -= 1
             if block.ref_cnt == 0 and not block.is_null:
                 if block.block_hash is None:
                     blocks_without_hash.append(block)
+                elif use_slru and (
+                    # A hashed block always has a recorded depth; treat a missing
+                    # one as unprotected rather than guessing.
+                    block.block_hash_num_tokens is not None
+                    and block.block_hash_num_tokens <= protected_tokens
+                ):
+                    protected_blocks.append(block)
                 else:
                     blocks_with_hash.append(block)
 
         # Blocks without hash always get evicted first - prepend them last to the tail
         self.free_block_queue.prepend_n(blocks_without_hash)
         self.free_block_queue.append_n(blocks_with_hash)
+        if protected_blocks:
+            self.free_block_queue.append_n(protected_blocks, protected=True)
 
     def evict_blocks(self, block_ids: set[int]) -> None:
         """evict blocks from the prefix cache by their block IDs.

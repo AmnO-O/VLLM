@@ -38,6 +38,7 @@ MambaDType = Literal["auto", "float32", "float16", "bfloat16"]
 MambaCacheMode = Literal["all", "align", "none"]
 PrefixCachingHashAlgo = Literal["sha256", "sha256_cbor", "xxhash", "xxhash_cbor"]
 KVOffloadingBackend = Literal["native", "lmcache"]
+PrefixCachePolicy = Literal["lru", "slru"]
 
 
 @config
@@ -108,6 +109,45 @@ class CacheConfig:
       security risk tolerance against the performance benefits before turning this on.
     - "xxhash_cbor" combines canonical CBOR serialization with xxHash for
       reproducible hashing. Requires the optional ``xxhash`` package."""
+    prefix_cache_policy: PrefixCachePolicy | None = None
+    """Free-list eviction ordering policy for the V1 prefix cache:
+
+    - "lru" (default) evicts the least-recently-freed block. Within a single
+      freed request, tail blocks are already ordered ahead of prefix blocks, so
+      plain LRU is mildly prefix-preserving.
+    - "slru" splits the free list into a protected and a probationary segment.
+      Blocks whose prefix depth is at or below `slru_protected_tokens` go to the
+      protected segment and are only evicted once the probationary segment is
+      exhausted. Both segments stay O(1) and add no per-block memory.
+
+    Falls back to the `VLLM_PREFIX_CACHE_POLICY` environment variable, then to
+    "lru", when unset."""
+    slru_protected_tokens: int | None = Field(default=None, ge=0)
+    """Prefix depth in tokens at or below which a block enters the SLRU
+    protected segment. Only meaningful when `prefix_cache_policy="slru"`.
+    Falls back to `VLLM_SLRU_PROTECTED_TOKENS`, then to 1000, when unset."""
+    enable_skip_filler_hashing: bool | None = None
+    """Skip prefix-cache hash-map insertion for turn-local "filler" blocks,
+    i.e. blocks whose prefix depth exceeds `filler_depth_tokens`. Such blocks
+    are written once and never produce a cache hit, so inserting them costs
+    scheduler CPU (a GIL-bound resource) and buys nothing.
+
+    WARNING: this trades hit rate for CPU. If your workload *does* share prefixes
+    deeper than `filler_depth_tokens`, those hits are lost. Set
+    `filler_depth_tokens` to at least the length of your longest shared prefix,
+    or disable this.
+
+    Falls back to `VLLM_SKIP_FILLER_HASHING`, then to True, when unset."""
+    filler_depth_tokens: int | None = Field(default=None, ge=0)
+    """Prefix depth in tokens beyond which a block is treated as write-once
+    filler by `enable_skip_filler_hashing`. Falls back to
+    `VLLM_FILLER_DEPTH_TOKENS`, then to 2000, when unset."""
+    prefix_cache_stats: bool | None = None
+    """Collect prefix-cache eviction counters (eviction count, eviction depth
+    histogram, free-block low-water mark, hash insert/skip counts) and log a
+    summary periodically. Intended for measurement runs; off by default so the
+    serving hot path pays nothing. Falls back to `VLLM_PREFIX_CACHE_STATS`, then
+    to False, when unset."""
     calculate_kv_scales: bool = False
     """Deprecated: This option is deprecated and will be removed in v0.19.
     It enables dynamic calculation of `k_scale` and `v_scale` when

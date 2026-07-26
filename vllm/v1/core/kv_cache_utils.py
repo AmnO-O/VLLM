@@ -194,6 +194,26 @@ class FreeKVCacheBlockQueue:
     Note that we maintain this order by reversing the block order when free
     blocks of a request. This operation is outside of this class.
 
+    Segmented LRU (SLRU)
+    --------------------
+    The queue maintains *two* lists: a **probationary** segment (the historical
+    single list, still reachable as `fake_free_list_head`/`fake_free_list_tail`)
+    and a **protected** segment. Victims are always taken from the probationary
+    segment first; the protected segment is only drained once the probationary
+    one is exhausted. Callers choose a block's segment when returning it via
+    `append`/`append_n`/`prepend_n`.
+
+    Under the default `lru` policy nothing is ever placed in the protected
+    segment, so it stays empty and every operation reduces to the original
+    single-list behavior. This keeps the default path free of new work beyond one
+    already-taken branch.
+
+    Because the linked list is intrusive, `remove()` needs no knowledge of which
+    segment a block lives in — unlinking is identical in both. That is why SLRU
+    here costs **zero extra bytes per block**: segment membership is implied by
+    which list a block is threaded into, and `num_free_blocks` remains a single
+    total across both segments.
+
     Args:
         blocks: A list of KVCacheBlock objects.
     """
@@ -216,6 +236,11 @@ class FreeKVCacheBlockQueue:
         # in the queue has prev and next blocks.
         self.fake_free_list_head = KVCacheBlock(block_id=-1)
         self.fake_free_list_tail = KVCacheBlock(block_id=-1)
+        # Protected segment sentinels. Starts empty; only SLRU ever fills it.
+        self.fake_protected_list_head = KVCacheBlock(block_id=-1)
+        self.fake_protected_list_tail = KVCacheBlock(block_id=-1)
+        self.fake_protected_list_head.next_free_block = self.fake_protected_list_tail
+        self.fake_protected_list_tail.prev_free_block = self.fake_protected_list_head
         if self.num_free_blocks > 0:
             # Connect fake_head and fake_tail to the first and last block
             # respectively.
@@ -228,25 +253,47 @@ class FreeKVCacheBlockQueue:
             self.fake_free_list_head.next_free_block = self.fake_free_list_tail
             self.fake_free_list_tail.prev_free_block = self.fake_free_list_head
 
+    def _segment(self, protected: bool) -> tuple[KVCacheBlock, KVCacheBlock]:
+        """Return the (head, tail) sentinels of the requested segment."""
+        if protected:
+            return self.fake_protected_list_head, self.fake_protected_list_tail
+        return self.fake_free_list_head, self.fake_free_list_tail
+
+    def _segments_in_eviction_order(
+        self,
+    ) -> tuple[tuple[KVCacheBlock, KVCacheBlock], ...]:
+        """Segments ordered so that earlier ones are evicted first."""
+        return (
+            (self.fake_free_list_head, self.fake_free_list_tail),
+            (self.fake_protected_list_head, self.fake_protected_list_tail),
+        )
+
+    def _first_free_block(self) -> KVCacheBlock | None:
+        """Return the next eviction victim, or None if no free block exists.
+
+        Probationary blocks are consumed before protected ones.
+        """
+        for head, tail in self._segments_in_eviction_order():
+            block = head.next_free_block
+            if block is not None and block is not tail:
+                return block
+        return None
+
     def popleft(self) -> KVCacheBlock:
         """Pop the first free block and reduce num_free_blocks by 1.
 
         Returns:
             The first free block.
         """
-        if (
-            self.fake_free_list_head.next_free_block is self.fake_free_list_tail
-            or self.fake_free_list_head.next_free_block is None
-        ):
+        first_block = self._first_free_block()
+        if first_block is None:
             assert self.num_free_blocks == 0, (
                 f"num_free_blocks ({self.num_free_blocks}) is out of sync "
                 "with the free list."
             )
             raise ValueError("No free blocks available")
 
-        first_block: KVCacheBlock = self.fake_free_list_head.next_free_block
-
-        if first_block.next_free_block is None:
+        if first_block.next_free_block is None or first_block.prev_free_block is None:
             # This should not happen if the block is from the free list.
             # It indicates a bug in the caller's logic.
             raise RuntimeError(
@@ -254,10 +301,10 @@ class FreeKVCacheBlockQueue:
                 "which doesn't have a valid next_free_block"
             )
 
-        # Connect fake_head and the next block of first_block (i.e. second block
-        # or fake tail).
-        self.fake_free_list_head.next_free_block = first_block.next_free_block
-        first_block.next_free_block.prev_free_block = self.fake_free_list_head
+        # Unlink via the block's own neighbours so that this works for either
+        # segment without needing to know which one the block is in.
+        first_block.prev_free_block.next_free_block = first_block.next_free_block
+        first_block.next_free_block.prev_free_block = first_block.prev_free_block
 
         # Remove the block from the linked list.
         first_block.prev_free_block = first_block.next_free_block = None
@@ -267,6 +314,9 @@ class FreeKVCacheBlockQueue:
 
     def popleft_n(self, n: int) -> list[KVCacheBlock]:
         """Pop the first n free blocks and reduce num_free_blocks by n.
+
+        Blocks are taken from the probationary segment first and only then from
+        the protected segment, so a single call may span both.
 
         Args:
             n: The number of blocks to pop.
@@ -279,23 +329,32 @@ class FreeKVCacheBlockQueue:
         assert self.num_free_blocks >= n
         self.num_free_blocks -= n
 
-        curr_block = self.fake_free_list_head.next_free_block
-        # Pop n blocks from the head of the list
-        ret = []
-        for _ in range(n):
-            assert curr_block is not None
-            ret.append(curr_block)
-            last_block = curr_block
-            curr_block = curr_block.next_free_block
-            # Reset prev_free_block and next_free_block of all popped blocks
-            last_block.prev_free_block = None
-            last_block.next_free_block = None
+        ret: list[KVCacheBlock] = []
+        for head, tail in self._segments_in_eviction_order():
+            curr_block = head.next_free_block
+            # Walk at most the blocks we are taking from this segment, stopping
+            # early at the segment's tail sentinel.
+            while len(ret) < n and curr_block is not None and curr_block is not tail:
+                ret.append(curr_block)
+                last_block = curr_block
+                curr_block = curr_block.next_free_block
+                # Reset prev_free_block and next_free_block of all popped blocks
+                last_block.prev_free_block = None
+                last_block.next_free_block = None
 
-        if curr_block is not None:
-            # The queue is not empty, connect the fake head to
-            # the new first block.
-            self.fake_free_list_head.next_free_block = curr_block
-            curr_block.prev_free_block = self.fake_free_list_head
+            if curr_block is not None:
+                # Connect this segment's fake head to its first surviving block
+                # (or to its tail sentinel, which correctly empties it).
+                head.next_free_block = curr_block
+                curr_block.prev_free_block = head
+
+            if len(ret) == n:
+                break
+
+        assert len(ret) == n, (
+            f"popleft_n({n}) only found {len(ret)} blocks; num_free_blocks is "
+            "out of sync with the free lists."
+        )
         return ret
 
     def remove(self, block: KVCacheBlock) -> None:
@@ -318,40 +377,45 @@ class FreeKVCacheBlockQueue:
         block.prev_free_block = block.next_free_block = None
         self.num_free_blocks -= 1
 
-    def append(self, block: KVCacheBlock) -> None:
+    def append(self, block: KVCacheBlock, protected: bool = False) -> None:
         """Put a block back into the free list and increase
         num_free_blocks by 1.
 
         Args:
             block: The block to append.
+            protected: Append to the protected segment instead of the
+                probationary one (SLRU). Ignored under plain LRU, where callers
+                always pass False.
         """
-        if self.fake_free_list_tail.prev_free_block is None:
+        head, tail = self._segment(protected)
+        if tail.prev_free_block is None:
             raise RuntimeError(
                 "prev_free_block of fake_free_list_tail should always exist"
             )
-        last_block: KVCacheBlock = self.fake_free_list_tail.prev_free_block
+        last_block: KVCacheBlock = tail.prev_free_block
 
         # Connect the new block after the last block.
         last_block.next_free_block = block
         block.prev_free_block = last_block
 
         # Connect the fake tail after the new block.
-        block.next_free_block = self.fake_free_list_tail
-        self.fake_free_list_tail.prev_free_block = block
+        block.next_free_block = tail
+        tail.prev_free_block = block
 
         self.num_free_blocks += 1
 
-    def prepend_n(self, blocks: list[KVCacheBlock]) -> None:
+    def prepend_n(self, blocks: list[KVCacheBlock], protected: bool = False) -> None:
         """Put a list of blocks at the front of the free list."""
         if len(blocks) == 0:
             return
 
-        first_block = self.fake_free_list_head.next_free_block
+        head, _ = self._segment(protected)
+        first_block = head.next_free_block
         assert first_block is not None, (
             "next_free_block of fake_free_list_head should always exist"
         )
 
-        prev_block = self.fake_free_list_head
+        prev_block = head
         for block in blocks:
             block.prev_free_block = prev_block
             prev_block.next_free_block = block
@@ -362,16 +426,19 @@ class FreeKVCacheBlockQueue:
 
         self.num_free_blocks += len(blocks)
 
-    def append_n(self, blocks: list[KVCacheBlock]) -> None:
+    def append_n(self, blocks: list[KVCacheBlock], protected: bool = False) -> None:
         """Put a list of blocks back into the free list
 
         Args:
             blocks: The blocks to append.
+            protected: Append to the protected segment instead of the
+                probationary one (SLRU).
         """
         if len(blocks) == 0:
             return
 
-        last_block = self.fake_free_list_tail.prev_free_block
+        _, tail = self._segment(protected)
+        last_block = tail.prev_free_block
         assert last_block is not None, (
             "prev_free_block of fake_free_list_tail should always exist"
         )
@@ -382,42 +449,63 @@ class FreeKVCacheBlockQueue:
             last_block = block
 
         # Connect the last block of <blocks> to the fake tail
-        last_block.next_free_block = self.fake_free_list_tail
-        self.fake_free_list_tail.prev_free_block = last_block
+        last_block.next_free_block = tail
+        tail.prev_free_block = last_block
 
         self.num_free_blocks += len(blocks)
 
     def get_all_free_blocks(self) -> list[KVCacheBlock]:
-        """Get all free blocks in the free list. Mainly used for testing.
+        """Get all free blocks in eviction order. Mainly used for testing.
+
+        Probationary blocks come first, then protected ones.
 
         Returns:
             A list of free blocks.
         """
         ret = []
-        if self.fake_free_list_head.next_free_block is None:
-            raise RuntimeError(
-                "next_free_block of fake_free_list_head should always exist"
-            )
-        # Start from the first block
-        curr_block: KVCacheBlock = self.fake_free_list_head.next_free_block
-        # As long as next_free_block is available, we haven't reached to
-        # the fake tail yet.
-        while curr_block.next_free_block is not None:
-            ret.append(curr_block)
-            curr_block = curr_block.next_free_block
+        for head, tail in self._segments_in_eviction_order():
+            if head.next_free_block is None:
+                raise RuntimeError(
+                    "next_free_block of fake_free_list_head should always exist"
+                )
+            curr_block: KVCacheBlock = head.next_free_block
+            while curr_block is not tail and curr_block.next_free_block is not None:
+                ret.append(curr_block)
+                curr_block = curr_block.next_free_block
         return ret
+
+    def num_blocks_in_segment(self, protected: bool) -> int:
+        """Count blocks in one segment. O(n) — for tests and debugging only."""
+        head, tail = self._segment(protected)
+        count = 0
+        curr_block = head.next_free_block
+        while curr_block is not None and curr_block is not tail:
+            count += 1
+            curr_block = curr_block.next_free_block
+        return count
 
     def iter_blocks_after(
         self,
         cursor: KVCacheBlock | None,
     ) -> Iterator[KVCacheBlock]:
-        """Iterate free blocks in eviction order after the cursor."""
+        """Iterate free blocks in eviction order after the cursor.
+
+        Spans both segments: when the probationary segment is exhausted the
+        iteration continues into the protected one, matching the order in which
+        `popleft`/`popleft_n` would hand blocks out.
+        """
         if cursor is None:
             curr_block = self.fake_free_list_head.next_free_block
         else:
             curr_block = cursor.next_free_block
 
-        while curr_block is not None and curr_block is not self.fake_free_list_tail:
+        while curr_block is not None:
+            if curr_block is self.fake_free_list_tail:
+                # Cross from the probationary segment into the protected one.
+                curr_block = self.fake_protected_list_head.next_free_block
+                continue
+            if curr_block is self.fake_protected_list_tail:
+                return
             yield curr_block
             curr_block = curr_block.next_free_block
 

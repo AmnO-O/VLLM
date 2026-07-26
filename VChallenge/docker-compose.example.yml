@@ -1,0 +1,156 @@
+# VChallenge — prefix-cache policy configuration reference
+#
+# Every knob added by the prefix-cache optimization is settable two ways, so the
+# policy can be tuned here without editing source:
+#
+#   CLI flag                        Environment variable            Default
+#   ------------------------------  ------------------------------  -------
+#   --prefix-cache-policy           VLLM_PREFIX_CACHE_POLICY        lru
+#   --slru-protected-tokens         VLLM_SLRU_PROTECTED_TOKENS      1000
+#   --enable-skip-filler-hashing    VLLM_SKIP_FILLER_HASHING        true
+#   --filler-depth-tokens           VLLM_FILLER_DEPTH_TOKENS        2000
+#   --prefix-cache-stats            VLLM_PREFIX_CACHE_STATS         false
+#
+# Precedence: CLI flag > environment variable > default.
+#
+# ---------------------------------------------------------------------------
+# IMPORTANT — these flags only exist in a build of THIS source tree.
+# The published `vllm/vllm-openai:v0.22.1` image does not have them and will
+# exit with "unrecognized arguments". Pick one of:
+#
+#   (a) build from this tree      -> `build:` block below (slow, but self-contained)
+#   (b) mount this tree over the  -> `volumes:` + PYTHONPATH, only valid if the
+#       installed package               image's vLLM version matches this tree
+#
+# Option (b) is fast but fragile: this checkout is vLLM `main`, whose
+# `vllm/v1/core` API differs from v0.22.1. Mounting these files into a v0.22.1
+# image will fail at import. Use (b) only with a matching base image.
+# ---------------------------------------------------------------------------
+
+services:
+  model:
+    # (a) Build from this source tree.
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+      target: vllm-openai
+    image: vllm-vchallenge:local
+
+    # (b) Alternative: keep the published image and mount the modified package.
+    #     Only do this when the image's vLLM version matches this checkout.
+    # image: vllm/vllm-openai:v0.22.1
+    # volumes:
+    #   - ../vllm:/usr/local/lib/python3.12/dist-packages/vllm:ro
+    #   - /path/to/model:/model:ro
+
+    environment:
+      - CUDA_DEVICE_MAX_CONNECTIONS=1
+      - TOKENIZERS_PARALLELISM=false
+      - OMP_NUM_THREADS=3
+      - VLLM_LOGGING_LEVEL=INFO   # INFO so the resolved policy is logged at startup
+
+      # --- Prefix-cache policy via environment variables ---------------------
+      # Equivalent to the CLI flags below; the CLI flags win if both are set.
+      # Uncomment to drive the policy purely from the environment.
+      # - VLLM_PREFIX_CACHE_POLICY=slru
+      # - VLLM_SLRU_PROTECTED_TOKENS=1000
+      # - VLLM_SKIP_FILLER_HASHING=1
+      # - VLLM_FILLER_DEPTH_TOKENS=2000
+      # - VLLM_PREFIX_CACHE_STATS=1
+
+    entrypoint:
+      - python3
+      - -m
+      - vllm.entrypoints.openai.api_server
+    command:
+      - --model=/model
+      - --served-model-name=LFM2.5-1.2B-Instruct
+      - --host=0.0.0.0
+      - --port=8000
+      - --tensor-parallel-size=1
+
+      # --- QUANTIZATION & CACHING ---
+      - --enable-prefix-caching
+      - --kv-cache-dtype=fp8
+      - --quantization=fp8
+
+      # --- BATCH CAPACITY ---
+      - --max-model-len=4800
+      - --max-num-batched-tokens=8192
+      - --max-num-seqs=48
+      - --block-size=32
+      - --async-scheduling
+      - --disable-log-stats
+      - --gpu-memory-utilization=0.95
+
+      # --- CHUNKED PREFILL ---
+      - --enable-chunked-prefill
+      - --long-prefill-token-threshold=3500
+
+      # =====================================================================
+      # PREFIX CACHE POLICY
+      # =====================================================================
+      #
+      # Trace layout (4000-token prompts):
+      #   tokens    0-1000 : shared system prefix   (reused by all 70 convs)
+      #   tokens 1000-2000 : per-conversation prefix (reused across 6 turns)
+      #   tokens 2000-4000 : turn-local filler       (never reused)
+      #
+      # Hence protected=1000 and filler-depth=2000 below.
+
+      # --- Step 2: skip hashing write-once filler blocks (CPU win) ----------
+      # Removes ~63 pointless hash-map inserts per request from the GIL-bound
+      # scheduler path. Costs nothing in hit rate as long as filler-depth-tokens
+      # is >= your longest genuinely shared prefix.
+      - --enable-skip-filler-hashing
+      - --filler-depth-tokens=2000
+
+      # --- Step 4/5: segmented LRU (hit-rate win, only if evictions occur) ---
+      # Leave as `lru` until the Phase-0 gate shows a non-zero eviction count.
+      # If evictions are zero, this changes nothing and is not worth the risk.
+      - --prefix-cache-policy=lru
+      # - --prefix-cache-policy=slru
+      - --slru-protected-tokens=1000
+
+      # --- Phase 0: gate instrumentation ------------------------------------
+      # Turn ON for measurement runs, OFF for the submission. Logs eviction
+      # count, eviction-depth histogram, free-block low-water mark, and
+      # hash insert/skip counts. Requires VLLM_LOGGING_LEVEL=INFO.
+      # - --prefix-cache-stats
+
+    ports:
+      - "8000:8000"
+    shm_size: "2g"
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+
+# ---------------------------------------------------------------------------
+# Ablation matrix — run each independently, not stacked. Three runs each;
+# with Poisson arrivals on 3 CPU cores, run-to-run variance likely exceeds the
+# effect size of a policy change.
+#
+#   1. baseline        --prefix-cache-policy=lru   (no --enable-skip-filler-hashing)
+#   2. filler skip     --prefix-cache-policy=lru   --enable-skip-filler-hashing
+#   3. SLRU only       --prefix-cache-policy=slru  (no --enable-skip-filler-hashing)
+#   4. both            --prefix-cache-policy=slru  --enable-skip-filler-hashing
+#   5. caching off     (drop --enable-prefix-caching)  <-- run this FIRST
+#
+# Ablation 5 bounds every other number: if disabling prefix caching entirely
+# barely moves TTFT, the prefix-cache axis is not where the score is.
+#
+# Replay:
+#   pip install aiohttp
+#   python VChallenge/replay_trace.py \
+#       --base-url http://localhost:8000 \
+#       --model LFM2.5-1.2B-Instruct \
+#       --trace ../input_part2/trace_grading_public.jsonl \
+#       --label "filler-skip" --json-out results_filler_skip.json
+#
+# The harness excludes the 90 warmup rows (conversations 0-14) from all latency
+# statistics and exits non-zero if any graded request fails.
+# ---------------------------------------------------------------------------

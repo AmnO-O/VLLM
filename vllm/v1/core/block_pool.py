@@ -715,6 +715,10 @@ class BlockPool:
             self.policy_stats.record_allocation(
                 num_blocks, self.free_block_queue.num_free_blocks - num_blocks
             )
+            # Drive the periodic summary from the allocation path, not only from
+            # the eviction path: the gate's most likely answer is "zero
+            # evictions", and that answer must still get printed.
+            self._maybe_log_stats()
 
         ret: list[KVCacheBlock] = self.free_block_queue.popleft_n(num_blocks)
 

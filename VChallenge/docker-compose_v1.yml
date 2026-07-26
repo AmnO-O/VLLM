@@ -1,0 +1,187 @@
+# VChallenge — recommended serving configuration (v1)
+#
+# Rationale for every non-obvious choice is in VChallenge/propose.md.
+# Short version: on 3 CPU cores with an H200 serving a 1.2B model, the bottleneck
+# is the GIL-bound Python scheduler, not GPU compute. This config optimizes CPU
+# work per request first and leaves GPU-side knobs alone.
+#
+# Tunables (CLI flag OR environment variable; CLI > env > default):
+#
+#   --prefix-cache-policy           VLLM_PREFIX_CACHE_POLICY       lru
+#   --slru-protected-tokens         VLLM_SLRU_PROTECTED_TOKENS     1000
+#   --enable-skip-filler-hashing    VLLM_SKIP_FILLER_HASHING       true
+#   --filler-depth-tokens           VLLM_FILLER_DEPTH_TOKENS       2000
+#   --prefix-cache-stats            VLLM_PREFIX_CACHE_STATS        false
+#
+# ---------------------------------------------------------------------------
+# REQUIRED: these flags exist only in a build of THIS source tree.
+# `vllm/vllm-openai:v0.22.1` will exit with "unrecognized arguments".
+# The `build:` block below handles that. A volume-mount over the published
+# image is NOT a valid substitute here: this checkout is vLLM `main`, whose
+# `vllm/v1/core` API differs from v0.22.1, and the mount fails at import.
+# ---------------------------------------------------------------------------
+
+services:
+  model:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+      target: vllm-openai
+    image: vllm-vchallenge:v1
+
+    environment:
+      - CUDA_DEVICE_MAX_CONNECTIONS=1
+      # Keep the tokenizer single-threaded: extra threads only contend for the
+      # 3 cores the scheduler needs.
+      - TOKENIZERS_PARALLELISM=false
+      - OMP_NUM_THREADS=3
+      # ERROR keeps logging I/O off the critical path for the scored run.
+      # The measurement profile at the bottom of this file overrides it.
+      - VLLM_LOGGING_LEVEL=ERROR
+
+    entrypoint:
+      - python3
+      - -m
+      - vllm.entrypoints.openai.api_server
+    command:
+      - --model=/model
+      - --served-model-name=LFM2.5-1.2B-Instruct
+      - --host=0.0.0.0
+      - --port=8000
+      - --tensor-parallel-size=1
+
+      # ================================================================
+      # QUANTIZATION & KV CACHE
+      # ================================================================
+      - --enable-prefix-caching
+      - --kv-cache-dtype=fp8
+      - --quantization=fp8
+
+      # T1.1 — the single largest CPU win available.
+      # The default (sha256) pickles every block before hashing. At block-size
+      # 32 a 4000-token prompt is 125 blocks, so a 420-request replay performs
+      # ~52,500 pickle+SHA256 operations inside the GIL-bound scheduler.
+      # xxhash is a non-cryptographic 128-bit hash and is several times faster.
+      # Dependency comes from 294e8acaa (xxhash added to requirements).
+      # Trade-off: higher collision risk than SHA-256 — fine single-tenant.
+      - --prefix-caching-hash-algo=xxhash
+
+      # ================================================================
+      # BATCH CAPACITY
+      # ================================================================
+      - --max-model-len=4800            # 4000-token prompt + 200 output + headroom
+      - --max-num-batched-tokens=8192
+      - --max-num-seqs=48
+      - --block-size=32
+      # A/B (T1.3): --block-size=64 halves blocks per request 125 -> 63, halving
+      # per-block hashing, map inserts and free-list links. Costs cache
+      # granularity (a 1000-token prefix covers 15.6 blocks instead of 31.2).
+      # Confirm your attention backend accepts 64 before relying on it.
+      - --async-scheduling
+      - --disable-log-stats
+      - --gpu-memory-utilization=0.95
+      # See propose.md §2: read "Maximum concurrency" from the startup log. If it
+      # is far above 70, this is over-provisioned and you are paying startup time
+      # and RSS for KV blocks you will never use. Cap it with:
+      #   --kv-cache-memory-bytes=<bytes>
+      # This does NOT reduce steady-state GC — engine init already calls
+      # freeze_gc_heap() after the block pool is built.
+
+      # ================================================================
+      # CHUNKED PREFILL
+      # ================================================================
+      - --enable-chunked-prefill
+      - --long-prefill-token-threshold=3500
+
+      # ================================================================
+      # PREFIX CACHE POLICY
+      # ================================================================
+      #
+      # Trace layout (4000-token prompts):
+      #   tokens    0-1000 : shared system prefix    (reused by all 70 convs)
+      #   tokens 1000-2000 : per-conversation prefix (reused across 6 turns)
+      #   tokens 2000-4000 : turn-local filler       (never reused)
+
+      # T1.2 — skip hash-map insertion for the ~63 write-once blocks per request
+      # (~20,800 pointless inserts + matching removals per graded run).
+      # Saves map churn, NOT hash computation: block hashes are computed eagerly
+      # at request construction. That is what --prefix-caching-hash-algo is for.
+      - --enable-skip-filler-hashing
+      - --filler-depth-tokens=2000
+
+      # T3.1 — leave at `lru` until the startup log proves evictions occur.
+      # SLRU is implemented and tested, but if the KV cache never fills it
+      # changes nothing. Flipping to slru is a one-word edit; the protected
+      # depth is already set for this trace.
+      - --prefix-cache-policy=lru
+      - --slru-protected-tokens=1000
+
+      # ================================================================
+      # DELIBERATELY NOT ENABLED
+      # ================================================================
+      #
+      # --always-prioritize-decode  (from 294e8acaa)
+      #   Drops the `not prefill_capacity_bound` guard, so prefills are deferred
+      #   strictly more often. That trades TTFT for TPOT. The scored criteria are
+      #   TTFT p50 < 50ms and TTFT p95, and every request here is a 4000-token
+      #   prefill producing only 200 tokens — so this pushes the wrong way.
+      #   A/B it alone before believing otherwise.
+      #
+      # --stream-interval=N  (N > 1)
+      #   Looks like a CPU win (66,000 SSE chunks per run), but the first chunk
+      #   would then carry N tokens and be emitted later — directly inflating
+      #   measured TTFT. Keep the default of 1.
+
+    ports:
+      - "8000:8000"
+    shm_size: "2g"
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+
+# ---------------------------------------------------------------------------
+# MEASUREMENT PROFILE
+#
+# For a Phase-0 gate run, override the two logging settings:
+#
+#   docker compose -f docker-compose_v1.yml run --rm \
+#     -e VLLM_LOGGING_LEVEL=INFO -e VLLM_PREFIX_CACHE_STATS=1 model
+#
+# Then look for, at startup:
+#     GPU KV cache size: N tokens
+#     Maximum concurrency for 4800 tokens per request: X.XXx
+#   -> X >> 70 means the cache never fills and no eviction policy can help.
+#
+# and during the run:
+#     prefix-cache stats: evictions=... allocations=... hash_inserts=...
+#                         hash_inserts_skipped=... min_free_blocks=...
+#   -> evictions=0 across a full replay settles the gate.
+#
+# ---------------------------------------------------------------------------
+# ABLATION MATRIX — one variable at a time, >=3 runs each. With Poisson arrivals
+# over 303s on 3 cores, run-to-run variance likely exceeds the effect size of a
+# single change, so stacked changes are uninterpretable.
+#
+#   A  drop --enable-prefix-caching        <-- RUN FIRST; bounds everything else
+#   B  baseline: sha256, no filler skip, lru
+#   C  B + --prefix-caching-hash-algo=xxhash
+#   D  C + --enable-skip-filler-hashing        <-- this file
+#   E  D + --block-size=64
+#   F  D + --prefix-cache-policy=slru          (only if the gate showed evictions)
+#   G  D + --always-prioritize-decode          (expect a TTFT regression)
+#
+# Replay:
+#   pip install aiohttp
+#   python VChallenge/replay_trace.py \
+#       --base-url http://localhost:8000 \
+#       --model LFM2.5-1.2B-Instruct \
+#       --trace ../input_part2/trace_grading_public.jsonl \
+#       --label D --json-out results_D.json
+#
+# The harness excludes the 90 warmup rows (conversations 0-14) from all latency
+# statistics and exits non-zero if any graded request fails.
+# ---------------------------------------------------------------------------

@@ -160,6 +160,11 @@ class SchedulerConfig:
     avoid gaps in GPU utilization, leading to better latency and throughput.
     """
 
+    always_prioritize_decode: bool = False
+    """If True, the scheduler will always prioritize decode requests over
+    prefill requests. This is useful for interactive workloads where decode
+    latency is more important than prefill throughput."""
+
     stream_interval: int = Field(default=1, ge=1)
     """The interval (or buffer size) for streaming in terms of token length.
     A smaller value (1) makes streaming smoother by sending each token immediately,

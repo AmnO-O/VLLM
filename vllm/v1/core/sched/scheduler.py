@@ -434,11 +434,14 @@ class Scheduler(SchedulerInterface):
 
         self.kv_cache_manager.new_step_starts()
 
-        # DP prefill balancing: on a throttled (non-cadence-aligned) step, defer
-        # all prefill compute unless saturated.
-        defer_prefills = (
-            throttle_prefills and not self.prefill_capacity_bound
-        ) and any(not r.is_prefill_chunk for r in self.running)
+        # Defer prefills based on the scheduling policy.
+        has_decode_reqs = any(not r.is_prefill_chunk for r in self.running)
+        if self.scheduler_config.always_prioritize_decode:
+            defer_prefills = throttle_prefills and has_decode_reqs
+        else:
+            defer_prefills = (
+                throttle_prefills and not self.prefill_capacity_bound
+            ) and has_decode_reqs
 
         # First, schedule the RUNNING requests.
         req_index = 0

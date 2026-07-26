@@ -715,6 +715,11 @@ class EngineArgs:
 
     stream_interval: int = SchedulerConfig.stream_interval
 
+    always_prioritize_decode: bool = SchedulerConfig.always_prioritize_decode
+    """If True, the scheduler will always prioritize decode requests over
+    prefill requests. This is useful for interactive workloads where decode
+    latency is more important than prefill throughput."""
+
     kv_sharing_fast_prefill: bool = CacheConfig.kv_sharing_fast_prefill
     optimization_level: OptimizationLevel = VllmConfig.optimization_level
     performance_mode: PerformanceMode = VllmConfig.performance_mode
@@ -1478,6 +1483,10 @@ class EngineArgs:
         scheduler_group.add_argument(
             "--stream-interval", **scheduler_kwargs["stream_interval"]
         )
+        scheduler_group.add_argument(
+            "--always-prioritize-decode",
+            **scheduler_kwargs["always_prioritize_decode"],
+        )
 
         # Compilation arguments
         compilation_kwargs = get_kwargs(CompilationConfig)
@@ -2180,6 +2189,7 @@ class EngineArgs:
             disable_hybrid_kv_cache_manager=self.disable_hybrid_kv_cache_manager,
             async_scheduling=self.async_scheduling,
             stream_interval=self.stream_interval,
+            always_prioritize_decode=self.always_prioritize_decode,
         )
 
         if not model_config.is_multimodal_model and self.default_mm_loras:

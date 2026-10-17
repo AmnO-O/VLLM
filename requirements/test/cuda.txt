@@ -716,7 +716,7 @@ outlines-core==0.2.14
     # via
     #   -c requirements/common.txt
     #   -r requirements/test/../common.txt
-packaging==24.2
+packaging==26.2
     # via
     #   accelerate
     #   bitsandbytes
